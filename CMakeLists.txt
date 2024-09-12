@@ -57,6 +57,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(googletest)
 
 add_subdirectory(integration)
+add_subdirectory(integration-alloc)
 add_subdirectory(matrix_mul)
 add_subdirectory(montecarlo)
 add_subdirectory(wordcloud)
