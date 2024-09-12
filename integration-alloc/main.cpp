@@ -120,7 +120,7 @@ int main(const int argc, const char * const argv[]) {
         spdlog::info("preparing for vectorized integration");
 
         // {{UnoAPI:main-parallel-devices:begin}}
-        sycl::device device { run_cpuonly ? sycl::cpu_selector_v : sycl::default_selector_v };
+        sycl::device device { run_cpuonly ? sycl::cpu_selector_v : sycl::gpu_selector_v };
         // {{UnoAPI:main-parallel-devices:end}}
 
         // we allow the queue to figure out the correct ordering of the three tasks
