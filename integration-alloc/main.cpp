@@ -23,12 +23,38 @@ template <class Indexable> void print_function_values(const Indexable & values, 
 }
 // {{UnoAPI:main-print-function-values:end}}
 
+template <typename T>
+class SyclAllocator {
+public:
+    // Defining type alias `value_type` for T.
+    using value_type = T;
+
+    // Pointer to SYCL queue. This allows the allocator can interact with the queue
+    // without copying the queue itself.
+    sycl::queue* q;
+
+    // Constructor That accepts a reference to a SYCL queue and stores it as a pointer.
+    SyclAllocator(sycl::queue &queue) : q(&queue) {}
+
+    T* allocate(std::size_t n) {
+        // Allocating using sycl::malloc_shared, allowing for host and device memory accessing.
+        // Dereferencing the queue pointer to specify which queue's context the memory should be allocated in.
+        return static_cast<T*>(sycl::malloc_shared(n * sizeof(T), *q));
+    }
+
+    void deallocate(T* p, std::size_t n) {
+        // Deallocating memory with sycl::free.
+        sycl::free(p, *q);
+    }
+};
+
 int main(const int argc, const char * const argv[]) {
     // {{UnoAPI:main-declarations:begin}}
     size_t total_workload{1000};
     uint grain_size{100};
     double x_min{0.0};
     double x_max{1.0};
+    bool with_usm_allocation{false};
     bool show_function_values{false};
     bool run_sequentially{false};
     bool run_cpuonly{false};
@@ -46,6 +72,7 @@ int main(const int argc, const char * const argv[]) {
     app.add_option("-u,--upper,--xmax", x_max, "x max value");
     app.add_option("-n,--total-workload", total_workload, "total workload (number of trapezoids)")->check(CLI::PositiveNumber.description(" >= 1"));
     app.add_option("-g,--grain-size", grain_size, "number of inner (sequential) trapezoids (for each outer trapezoid)")->check(CLI::PositiveNumber.description(" >= 1"));
+    app.add_flag("-w, --with-usm-allocation", with_usm_allocation);
     app.add_flag("-s,--sequential", run_sequentially);
     app.add_flag("-c,--cpu-only", run_cpuonly);
     app.add_flag("-v,--show-function-values", show_function_values);
@@ -108,21 +135,9 @@ int main(const int argc, const char * const argv[]) {
     // {{UnoAPI:main-sequential-option:end}}
     
     else {
-        // important: buffer NOT explicitly backed by host-allocated vector
-        // this allows the data to live on the device until accessed on the host (if desired)
-        // {{UnoAPI:main-parallel-buffers:begin}}
-        sycl::buffer<double> v_buf{sycl::range<1>{size}};
-        sycl::buffer<double> t_buf{sycl::range<1>{number_of_trapezoids}};
-        sycl::buffer<double> r_buf{sycl::range<1>{1}};
-        // {{UnoAPI:main-parallel-buffers:end}}
-
-        mark_time(timestamps,"Memory allocation");
-        spdlog::info("preparing for vectorized integration");
-
         // {{UnoAPI:main-parallel-devices:begin}}
-        sycl::device device { run_cpuonly ? sycl::cpu_selector_v : sycl::gpu_selector_v };
+        sycl::device device { run_cpuonly ? sycl::cpu_selector_v : sycl::default_selector_v };
         // {{UnoAPI:main-parallel-devices:end}}
-
         // we allow the queue to figure out the correct ordering of the three tasks
         // {{UnoAPI:main-parallel-queue:begin}}
         sycl::queue q{device, dpc_common::exception_handler};
@@ -131,57 +146,113 @@ int main(const int argc, const char * const argv[]) {
         spdlog::info("Device: {}", device_name);
         // {{UnoAPI:main-parallel-queue:end}}
 
-        // populate buffer with function values
-        // {{UnoAPI:main-parallel-submit-parallel-for-values:begin}}
-        q.submit([&](auto & h) {
-            const sycl::accessor v{v_buf, h};
-            h.parallel_for(size, [=](const auto & index) {
-                v[index] = f(x_min + index * dx);
-            });
-        }); // end of command group
-        // {{UnoAPI:main-parallel-submit-parallel-for-values:end}}
+        if (with_usm_allocation) {
+            // USM backed std::vector allocation::begin
+            // Creating an instance of SyclAllocator for type double. The allocator is associated with SYCL queue `q`, memory allocations
+            // will be maanged by this custom alocator for the device and host via Unified Shared Memory (USM).
+            SyclAllocator<double> allocator(q);
+            // Creating a std::vector `v_vec` to hold type double. The custom allocator (SyclAllocator) manages the memory in shared USM,
+            // making the vector's data accessible from both the host and device.
+            std::vector<double, SyclAllocator<double>> v_vec(size, allocator);
+            // Creating a std::vector `t_vec` to hold type double. The custom allocator (SyclAllocator) manages the memory in shared USM,
+            // making the vector's data accessible from both the host and device.
+            std::vector<double, SyclAllocator<double>> t_vec(number_of_trapezoids, allocator);
+            // Keeping r_buf as sycl::buffer, sycl::buffer is used for sycl::reduction. Have not found a way to do this
+            // with USM yet.
+            sycl::buffer<double> r_buf{sycl::range<1>{1}};
+            // USM backed std::vector allocation::end
+            mark_time(timestamps,"Memory allocation");
 
-        // populate buffer with trapezoid values
-        // the inner, sequential loop performs a finer-grained calculation
-        // {{UnoAPI:main-parallel-submit-parallel-for-trapezoids:begin}}
-        q.submit([&](auto & h) {
-            const sycl::accessor t{t_buf, h};
-            h.parallel_for(size, [=](const auto & index) {
-                t[index] = outer_trapezoid(grain_size, x_min + index * dx, dx_inner, half_dx_inner);
-            });
-        }); // end of command group
-        // {{UnoAPI:main-parallel-submit-parallel-for-trapezoids:end}}
+            // populate std::vector with function values::begin
+            q.submit([&](auto & h) {
+                // Capturing `v_vec: std::vector` by reference.
+                h.parallel_for(size, [=,v = &v_vec[0]](const auto & index) {
+                    // Using pointer `v` to modify the data in std::vector `v_vec`
+                    v[index] = f(x_min + index * dx);
+                });
+            }); // end of command group
+            // No need for q.wait() here, there are no dependencies between the first and second task.
+            // populate std::vector with function values::end
 
-        // perform reduction into result
-        // {{UnoAPI:main-parallel-submit-reduce:begin}}
-        q.submit([&](auto & h) {
-            const sycl::accessor t{t_buf, h};
-            const auto sum_reduction{sycl::reduction(r_buf, h, sycl::plus<>())};
-            h.parallel_for(sycl::range<1>{number_of_trapezoids}, sum_reduction, [=](const auto & index, auto & sum) {
-                sum.combine(t[index]);
-            });
-        }); // end of command group
-        // {{UnoAPI:main-parallel-submit-reduce:end}}
+            // populate buffer with trapezoid values
+            // the inner, sequential loop performs a finer-grained calculation
+            // {{UnoAPI:main-parallel-submit-parallel-for-trapezoids:begin}}
+            q.submit([&](auto & h) {
+                h.parallel_for(size, [=,t = &t_vec[0]](const auto & index) {
+                    t[index] = outer_trapezoid(grain_size, x_min + index * dx, dx_inner, half_dx_inner);
+                });
+            }); // end of command group
+            // Need q.wait() here, there are dependencies between the second and third task.
+            q.wait();
+            // {{UnoAPI:main-parallel-submit-parallel-for-trapezoids:end}}
 
-        spdlog::info("done submitting to queue...waiting for results");
-
-        // {{UnoAPI:main-parallel-gather-on-host:begin}}
-        const sycl::host_accessor result{r_buf};
-        mark_time(timestamps,"Integration");
-        spdlog::info("result should be available now");
-        fmt::print("result = {}\n", result[0]);
-        // {{UnoAPI:main-parallel-gather-on-host:end}}
-
-        // {{UnoAPI:main-parallel-show-results-log:begin}}
-        if (show_function_values) {
-            spdlog::info("preparing function values");
-            const sycl::host_accessor values{v_buf};
-            mark_time(timestamps,"Host data access");
-            spdlog::info("showing function values");
-            print_function_values(values, x_min, dx, x_precision, y_precision);
-            mark_time(timestamps,"Output");
+            // perform reduction into result
+            // {{UnoAPI:main-parallel-submit-reduce:begin}}
+            q.submit([&](auto & h) {
+                const auto sum_reduction{sycl::reduction(r_buf, h, sycl::plus<>())};
+                h.parallel_for(sycl::range<1>{number_of_trapezoids}, sum_reduction, [=,t = &t_vec[0]](const auto & index, auto & sum) {
+                    sum.combine(t[index]);
+                });
+            }); // end of command group
+            q.wait();
+            // {{UnoAPI:main-parallel-submit-reduce:end}}
+            spdlog::info("done submitting to queue...waiting for results");
+            const sycl::host_accessor result{r_buf};
+            mark_time(timestamps,"Integration");
+            spdlog::info("result should be available now");
+            fmt::print("result = {}\n", result[0]);
         }
-        // {{UnoAPI:main-parallel-show-results-log:end}}
+        else {
+            // important: buffer NOT explicitly backed by host-allocated vector
+            // this allows the data to live on the device until accessed on the host (if desired)
+            // {{UnoAPI:main-parallel-buffers:begin}}
+            sycl::buffer<double> v_buf{sycl::range<1>{size}};
+            sycl::buffer<double> t_buf{sycl::range<1>{number_of_trapezoids}};
+            sycl::buffer<double> r_buf{sycl::range<1>{1}};
+            // {{UnoAPI:main-parallel-buffers:end}}
+
+            mark_time(timestamps,"Memory allocation");
+            spdlog::info("preparing for vectorized integration");
+            // populate buffer with function values
+            // {{UnoAPI:main-parallel-submit-parallel-for-values:begin}}
+            q.submit([&](auto & h) {
+                const sycl::accessor v{v_buf, h};
+                h.parallel_for(size, [=](const auto & index) {
+                    v[index] = f(x_min + index * dx);
+                });
+            }); // end of command group
+            // {{UnoAPI:main-parallel-submit-parallel-for-values:end}}
+
+            // populate buffer with trapezoid values
+            // the inner, sequential loop performs a finer-grained calculation
+            // {{UnoAPI:main-parallel-submit-parallel-for-trapezoids:begin}}
+            q.submit([&](auto & h) {
+                const sycl::accessor t{t_buf, h};
+                h.parallel_for(size, [=](const auto & index) {
+                    t[index] = outer_trapezoid(grain_size, x_min + index * dx, dx_inner, half_dx_inner);
+                });
+            }); // end of command group
+            // {{UnoAPI:main-parallel-submit-parallel-for-trapezoids:end}}
+
+            // perform reduction into result
+            // {{UnoAPI:main-parallel-submit-reduce:begin}}
+            q.submit([&](auto & h) {
+                const sycl::accessor t{t_buf, h};
+                const auto sum_reduction{sycl::reduction(r_buf, h, sycl::plus<>())};
+                h.parallel_for(sycl::range<1>{number_of_trapezoids}, sum_reduction, [=](const auto & index, auto & sum) {
+                    sum.combine(t[index]);
+                });
+            }); // end of command group
+            // {{UnoAPI:main-parallel-submit-reduce:end}}
+            spdlog::info("done submitting to queue...waiting for results");
+
+            // {{UnoAPI:main-parallel-gather-on-host:begin}}
+            const sycl::host_accessor result{r_buf};
+            mark_time(timestamps,"Integration");
+            spdlog::info("result should be available now");
+            fmt::print("result = {}\n", result[0]);
+            // {{UnoAPI:main-parallel-gather-on-host:end}}
+        }
     }
     // end of scope waits for the queued work to complete
 
